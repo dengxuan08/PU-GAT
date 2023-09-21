@@ -29,7 +29,7 @@ cd upsampling
 python train.py --exp_name=the_project_name --gpu=gpu_number --use_gan --batch_size=12
 
 ```
-### Evaluation code
+#### Evaluation code
 We provide the code to calculate the uniform metric in the evaluation code folder. In order to use it, you need to install the CGAL library. Please refer [this link](https://www.cgal.org/download/linux.html) and  [PU-Net](https://github.com/yulequan/PU-Net) to install this library.
 Then:
    ```shell
@@ -40,5 +40,5 @@ Then:
    ```
 The second argument is the mesh, and the third one is the predicted points.
 
-### Questions
+#### Questions
 Please contact 'dengxuan08@hdu.edu.cn'
