@@ -1,0 +1,14 @@
+h5py
+matplotlib
+ninja
+numpy
+open3d
+opencv-python
+pandas
+Pillow
+plyfile
+scipy
+tensorboard
+tensorflow
+torch
+torchvision
