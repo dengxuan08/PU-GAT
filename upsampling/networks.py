@@ -1,11 +1,15 @@
 import os, sys
+
 sys.path.append("../")
 import torch
 import torch.nn as nn
 from torch.nn import Conv1d, Conv2d
 import torch.nn.functional as F
+from torch.autograd import Variable
+
 from torch import einsum
 from einops import repeat
+
 
 def knn(x, k):
     inner = -2*torch.matmul(x.transpose(2, 1), x)
@@ -14,6 +18,7 @@ def knn(x, k):
  
     idx = pairwise_distance.topk(k=k, dim=-1)[1]   # (batch_size, num_points, k)
     return idx
+
 
 def get_graph_feature(x, k=20, idx=None):
     batch_size = x.size(0)
@@ -24,19 +29,22 @@ def get_graph_feature(x, k=20, idx=None):
     device = torch.device('cuda')
 
     idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1)*num_points
+
     idx = idx + idx_base
+
     idx = idx.view(-1)
  
     _, num_dims, _ = x.size()
 
-    x = x.transpose(2, 1).contiguous()
+    x = x.transpose(2, 1).contiguous()   # (batch_size, num_points, num_dims)  -> (batch_size*num_points, num_dims) #   batch_size * num_points * k + range(0, batch_size*num_points)
     feature = x.view(batch_size*num_points, -1)[idx, :]
     feature = feature.view(batch_size, num_points, k, num_dims) 
     x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
-
+    
     feature = torch.cat((feature-x, x), dim=3).permute(0, 3, 1, 2).contiguous()
   
     return feature
+
 
 class RA_Layer(nn.Module):
     def __init__(self, channels):
@@ -53,23 +61,24 @@ class RA_Layer(nn.Module):
         self.softmax = nn.Softmax(dim=-1)
 
     def forward(self, x, rel_pos_emb):
-        x_q = self.q_conv(x).permute(0, 2, 1)# b, n, c
+        x_q = self.q_conv(x).permute(0, 2, 1)
 
-        x_k = self.k_conv(x)# b, c, n
+        # rel_pos_emb = rel_pos.max(dim=-1, keepdim=False)[0].permute(0,2,1)
+
+        x_k = self.k_conv(x)
         x_v = self.v_conv(x)
-
         # b, n, n
         energy = torch.bmm(x_q, x_k)
 
         # attention = self.softmax(energy)
         attention = self.softmax(energy + rel_pos_emb)
         attention = attention / (1e-9 + attention.sum(dim=1, keepdim=True))
-
         # b, c, n
         x_r = torch.bmm(x_v, attention)
         x_r = self.act(self.after_norm(self.trans_conv(x - x_r)))
         x = x + x_r
         return x
+
 
 class feature_extraction(nn.Module):
     def __init__(self, channels=128):
@@ -98,7 +107,7 @@ class feature_extraction(nn.Module):
                                   self.bn2,
                                   nn.LeakyReLU(negative_slope=0.2))
 
-    def forward(self, x, rel_pos_emb, pos):
+    def forward(self, x, rel_pos_emb,pos):
         x = self.mlp1(x)
         x1 = self.localattn1(x, pos)
         x2 = self.localattn2(x1, pos)
@@ -107,6 +116,7 @@ class feature_extraction(nn.Module):
         x = torch.cat((x1, x2, x3, x4), dim=1)
         x = self.mlp2(x)
         return x
+
 
 class Generator(nn.Module):
     def __init__(self, params=None):
@@ -123,12 +133,13 @@ class Generator(nn.Module):
         )
 
     def forward(self, input):
+        # 鐩稿浣嶇疆缂栫爜
         pos = input.permute(0, 2, 1)
         rel_pos = pos[:, :, None, :] - pos[:, None, :, :]
         rel_pos_emb = torch.clamp(rel_pos.sum(-1), -5, 5)
-        features = self.feature_extractor(input, rel_pos_emb, pos)  # b,648,n#
+        features = self.feature_extractor(input, rel_pos_emb, pos)  # b,648,n
 
-        H = self.up_projection_unit(features, pos)  # b,128,4*n
+        H = self.up_projection_unit(features)  # b,128,4*n
 
         coord = self.conv1(H)
         coord = self.conv2(coord)
@@ -137,7 +148,7 @@ class Generator(nn.Module):
 
 class Generator_recon(nn.Module):
     def __init__(self, params):
-        # 坐标重建
+        # 鍧愭爣閲嶅缓
         super(Generator_recon, self).__init__()
         self.feature_extractor = feature_extraction(128)
         self.up_ratio = params['up_ratio']
@@ -163,6 +174,7 @@ class Generator_recon(nn.Module):
         coord = self.conv2(coord)
         return coord
 
+
 class attention_unit(nn.Module):
     def __init__(self, in_channels=130):
         super(attention_unit, self).__init__()
@@ -178,7 +190,7 @@ class attention_unit(nn.Module):
             Conv1d(in_channels=in_channels, out_channels=in_channels, kernel_size=1),
             nn.ReLU()
         )
-        self.gamma = nn.Parameter(torch.zeros([1]).clone().detach()).cuda()
+        self.gamma = nn.Parameter(torch.tensor(torch.zeros([1]))).cuda()
 
     def forward(self, inputs):
         f = self.convF(inputs)
@@ -188,53 +200,52 @@ class attention_unit(nn.Module):
         beta = F.softmax(s, dim=2)  # b,n,n
 
         o = torch.matmul(h, beta)  # b,130,n
+
         x = self.gamma * o + inputs
+
         return x
+
 
 class up_block(nn.Module):
     def __init__(self,up_ratio=4,in_channels=130):
         super(up_block,self).__init__()
-        self.up_ratio = up_ratio
-        self.conv1 = nn.Sequential(
-            Conv1d(in_channels=in_channels, out_channels=256, kernel_size=1),
+        self.up_ratio=up_ratio
+        self.conv1=nn.Sequential(
+            Conv1d(in_channels=in_channels,out_channels=256,kernel_size=1),
             nn.ReLU()
         )
-        self.conv2 = nn.Sequential(
-            Conv1d(in_channels=256, out_channels=128, kernel_size=1),
+        self.conv2=nn.Sequential(
+            Conv1d(in_channels=256,out_channels=128,kernel_size=1),
             nn.ReLU()
         )
-        self.grid = self.gen_grid(up_ratio).clone().detach().requires_grad_(True)
-        self.attention_unit = attention_unit(in_channels=in_channels)
-        self.localattn = LocalAttention(
-            dim=130,
-            pos_mlp_hidden_dim=64,
-            attn_mlp_hidden_mult=4,
-            num_neighbors=16  # only the 16 nearest neighbors would be attended to for each point
-        )
-        self.edge_conv = nn.Sequential(nn.Conv2d(128 * 2, 128 * self.up_ratio, kernel_size=1, bias=False),
-                                       nn.BatchNorm2d(512),
-                                       nn.LeakyReLU(negative_slope=0.2))
+        self.grid=torch.tensor(self.gen_grid(up_ratio)).cuda()
+        self.attention_unit=attention_unit(in_channels=in_channels)
+        self.edge_conv = nn.Sequential(nn.Conv2d(128*2, 128*self.up_ratio,kernel_size=1,bias=False),
+                                   nn.BatchNorm2d(512),
+                                   nn.LeakyReLU(negative_slope=0.2))
+    def forward(self,inputs):
+        net=inputs #b,128,n
+        grid=self.grid.clone()
+        grid=grid.unsqueeze(0).repeat(net.shape[0],1,net.shape[2])#b,4,2*n
+        grid=grid.view([net.shape[0],-1,2])#b,4*n,2
 
-    def forward(self, inputs, pos):
-        net = inputs  # b,128,n
-        grid = self.grid.clone()
-        grid = grid.unsqueeze(0).repeat(net.shape[0], 1, net.shape[2])  # b,4,2*n
-        grid = grid.view([net.shape[0], -1, 2])  # b,4*n,2
-
-        x = get_graph_feature(net, k=20)
+        #net=net.permute(0,2,1)#b,n,128
+        x = get_graph_feature(net,k=20)
         net = self.edge_conv(x)
-        net = net.max(dim=-1, keepdim=False)[0].permute(0, 2, 1)
-        net = torch.reshape(net, (net.shape[0], net.shape[1] * self.up_ratio, -1))
+        net = net.max(dim=-1,keepdim=False)[0].permute(0,2,1)
+        net = torch.reshape(net,(net.shape[0],net.shape[1]*self.up_ratio,-1))
+        #net=net.repeat(1,self.up_ratio,1)#b,4n,128
+        net = torch.cat([net, grid], dim=2)  # b,n*4,130
 
-        net = torch.cat([net, grid.cuda()], dim=2)  # b,n*4,130
-        net = net.permute(0, 2, 1)  # b,130,n*4
+        net=net.permute(0,2,1)#b,130,n*4
 
-        net = self.localattn(net, pos)
+        net=self.attention_unit(net)
 
-        net = self.conv1(net)
-        net = self.conv2(net)
+        net=self.conv1(net)
+        net=self.conv2(net)
 
         return net
+
 
     def gen_grid(self,up_ratio):
         import math
@@ -251,6 +262,7 @@ class up_block(nn.Module):
         grid=torch.stack([x,y],dim=-1) # 2,2,2
         grid=grid.view([-1,2])#4,2
         return grid
+
 
 class down_block(nn.Module):
     def __init__(self, up_ratio=4, in_channels=128):
@@ -272,11 +284,12 @@ class down_block(nn.Module):
     def forward(self, inputs):
         net = inputs  # b,128,n*4
 
-        net = net.reshape(net.shape[0],net.shape[1]*self.up_ratio,-1)#b,128,4,n
-        net = self.conv(net)#b,256,1,n
+        net = net.reshape(net.shape[0],net.shape[1]*self.up_ratio,-1)
+        net = self.conv(net)
         net = self.conv1(net)
         net = self.conv2(net)
         return net
+
 
 class up_projection_unit(nn.Module):
     def __init__(self, up_ratio=4):
@@ -289,15 +302,18 @@ class up_projection_unit(nn.Module):
         self.up_block2 = up_block(up_ratio=4, in_channels=128 + 2)
         self.down_block = down_block(up_ratio=4, in_channels=128)
 
-    def forward(self, input, pos):
+    def forward(self, input):
         L = self.conv1(input)  # b,128,n
-        H0 = self.up_block1(L, pos)  # b,128,n*4
+
+        H0 = self.up_block1(L)  # b,128,n*4
         L0 = self.down_block(H0)  # b,128,n
 
+        # print(H0.shape,L0.shape,L.shape)
         E0 = L0 - L  # b,128,n
         H1 = self.up_block2(E0)  # b,128,4*n
         H2 = H0 + H1  # b,128,4*n
         return H2
+
 
 class mlp_conv(nn.Module):
     def __init__(self, in_channels, layer_dim):
@@ -326,6 +342,7 @@ class mlp_conv(nn.Module):
             net = module(net)
         return net
 
+
 class mlp(nn.Module):
     def __init__(self, in_channels, layer_dim):
         super(mlp, self).__init__()
@@ -353,6 +370,7 @@ class mlp(nn.Module):
             net = sub_module(net)
         return net
 
+
 class Discriminator(nn.Module):
     def __init__(self, params, in_channels):
         super(Discriminator, self).__init__()
@@ -368,7 +386,6 @@ class Discriminator(nn.Module):
         features = self.mlp_conv1(inputs)
         features_global = torch.max(features, dim=2)[0]  ##global feature
         features = torch.cat([features, features_global.unsqueeze(2).repeat(1, 1, features.shape[2])], dim=1)
-        features = get_graph_feature(features, k=20)
         features = self.attention_unit(features)
 
         features = self.mlp_conv2(features)
@@ -386,11 +403,14 @@ class Discriminator(nn.Module):
                 for param in net.parameters():
                     param.requires_grad = requires_grad
 
+
 def exists(val):
     return val is not None
 
+
 def max_value(t):
     return torch.finfo(t.dtype).max
+
 
 def batched_index_select(values, indices, dim=1):
     value_dims = values.shape[(dim + 1):]
@@ -408,6 +428,7 @@ def batched_index_select(values, indices, dim=1):
     dim += value_expand_len
     return values.gather(dim, indices)
 
+
 class LocalAttention(nn.Module):
     def __init__(
             self,
@@ -419,6 +440,7 @@ class LocalAttention(nn.Module):
     ):
         super().__init__()
         self.num_neighbors = num_neighbors
+
         self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
 
         self.pos_mlp = nn.Sequential(
@@ -434,7 +456,7 @@ class LocalAttention(nn.Module):
         )
 
     def forward(self, x, pos, mask=None):
-        x = x.permute(0, 2, 1)  # transpose
+        x = x.permute(0, 2, 1)
         n, num_neighbors = x.shape[1], self.num_neighbors
 
         # get queries, keys, values
@@ -452,7 +474,7 @@ class LocalAttention(nn.Module):
             mask = mask[:, :, None] * mask[:, None, :]
 
         # expand values
-        v = repeat(v, 'b j d -> b i j d', i=n)  #  (x,y,z)->(x,n,y,z)
+        v = repeat(v, 'b j d -> b i j d', i=n)
 
         # determine k nearest neighbors for each point, if specified
         if exists(num_neighbors) and num_neighbors < n:
@@ -487,6 +509,7 @@ class LocalAttention(nn.Module):
         agg = einsum('b i j d, b i j d -> b i d', attn, v)
         agg = agg.permute(0, 2, 1)
         return agg
+
 
 if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
